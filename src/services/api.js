@@ -1,18 +1,20 @@
 import { localBackend } from './localBackend.js';
 
-// Environment variable configured backend URL or default relative /api
-const REMOTE_API_URL = import.meta.env.VITE_API_URL || '';
-const API_BASE = REMOTE_API_URL ? `${REMOTE_API_URL.replace(/\/$/, '')}/api` : '/api';
+// ---------------------------------------------------------------------------
+// Smart Campus Fix – API Service
+//
+// Architecture:
+//   • VITE_API_URL set  → all calls go to the real Express/SQLite backend
+//   • VITE_API_URL unset (default, Vercel demo deployment) → all calls are
+//     handled entirely in the browser by localBackend (localStorage-backed).
+//     No network fetch is ever attempted in this mode.
+// ---------------------------------------------------------------------------
 
-// Tracks whether the application is running in local client-side demo mode.
-// When no VITE_API_URL is configured, there is no backend to call, so we
-// immediately activate the integrated local demonstration engine. This prevents
-// the deployed Vercel build from attempting a fetch to a non-existent /api
-// route (which results in a 404 or an HTML response) before falling back.
-let useLocalFallback = !REMOTE_API_URL;
+// Resolved at Vite build time. Empty string when not configured.
+const REMOTE_API_URL = import.meta.env.VITE_API_URL || '';
 
 export function isLocalDemoMode() {
-  return useLocalFallback || !REMOTE_API_URL;
+  return !REMOTE_API_URL;
 }
 
 // Client-side dispatcher for local demo mode
@@ -84,66 +86,50 @@ async function handleLocalRequest(endpoint, options = {}) {
   throw new Error(`Local handler not implemented for ${method} ${path}`);
 }
 
-export async function request(endpoint, options = {}) {
-  // If we already know we are in local demo mode, execute locally immediately
-  if (useLocalFallback) {
-    return handleLocalRequest(endpoint, options);
-  }
-
+// ---------------------------------------------------------------------------
+// remoteRequest – used ONLY when VITE_API_URL is explicitly configured.
+// Makes a real network fetch to the Express backend.
+// ---------------------------------------------------------------------------
+async function remoteRequest(endpoint, options = {}) {
+  const API_BASE = `${REMOTE_API_URL.replace(/\/$/, '')}/api`;
   const token = localStorage.getItem('scf_token');
-  const headers = {
-    ...(options.headers || {})
-  };
+  const headers = { ...(options.headers || {}) };
 
   if (token) {
     headers['Authorization'] = `Bearer ${token}`;
   }
-
-  // If not FormData, default to application/json
   if (!(options.body instanceof FormData)) {
     headers['Content-Type'] = 'application/json';
   }
 
-  try {
-    const response = await fetch(`${API_BASE}${endpoint}`, {
-      ...options,
-      headers
-    });
+  const response = await fetch(`${API_BASE}${endpoint}`, { ...options, headers });
 
-    // If endpoint returned 404 and there's no custom remote VITE_API_URL configured,
-    // this indicates the frontend is running on a static host (e.g. Vercel) without a running backend.
-    // Seamlessly transition to the integrated local demo repository.
-    if (response.status === 404 && !REMOTE_API_URL) {
-      console.info(`[Smart Campus Fix] API endpoint ${endpoint} returned 404 on static deployment. Switching to local demonstration engine.`);
-      useLocalFallback = true;
-      return handleLocalRequest(endpoint, options);
-    }
+  const contentType = response.headers.get('content-type');
+  let data = {};
+  if (contentType && contentType.includes('application/json')) {
+    data = await response.json();
+  }
 
-    const contentType = response.headers.get('content-type');
-    let data = {};
-    if (contentType && contentType.includes('application/json')) {
-      data = await response.json();
-    }
-
-    if (!response.ok) {
-      const errorMsg = data.error || data.message || `Request failed with status ${response.status}`;
-      const err = new Error(errorMsg);
-      err.status = response.status;
-      err.data = data;
-      throw err;
-    }
-
-    return data;
-  } catch (err) {
-    // If network connection failed (e.g. connection refused to localhost or offline)
-    // and no custom remote VITE_API_URL is specified, fall back to local demo mode.
-    if (!REMOTE_API_URL && (err.name === 'TypeError' || err.message?.includes('Failed to fetch') || err.message?.includes('NetworkError'))) {
-      console.info(`[Smart Campus Fix] Network fetch failed. Activating local demonstration engine.`);
-      useLocalFallback = true;
-      return handleLocalRequest(endpoint, options);
-    }
+  if (!response.ok) {
+    const errorMsg = data.error || data.message || `Request failed with status ${response.status}`;
+    const err = new Error(errorMsg);
+    err.status = response.status;
+    err.data = data;
     throw err;
   }
+  return data;
+}
+
+// ---------------------------------------------------------------------------
+// request – public entry point.
+//   • No VITE_API_URL → localBackend (pure in-browser, no network call).
+//   • VITE_API_URL set → real backend via remoteRequest.
+// ---------------------------------------------------------------------------
+export function request(endpoint, options = {}) {
+  if (!REMOTE_API_URL) {
+    return handleLocalRequest(endpoint, options);
+  }
+  return remoteRequest(endpoint, options);
 }
 
 export const api = {
